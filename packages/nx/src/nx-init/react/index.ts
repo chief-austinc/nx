@@ -2,13 +2,14 @@ import { execSync } from 'child_process';
 import { copySync, moveSync, readdirSync, removeSync } from 'fs-extra';
 import { join } from 'path';
 import { InitArgs } from '../../command-line/init';
-import { fileExists, readJsonFile } from '../../utils/fileutils';
+import { fileExists, readJsonFile, writeJsonFile } from '../../utils/fileutils';
 import { output } from '../../utils/output';
 import {
   detectPackageManager,
   getPackageManagerCommand,
   PackageManagerCommands,
 } from '../../utils/package-manager';
+import { PackageJson } from '../../utils/package-json';
 import { askAboutNxCloud, printFinalMessage } from '../utils';
 import { checkForCustomWebpackSetup } from './check-for-custom-webpack-setup';
 import { checkForUncommittedChanges } from './check-for-uncommitted-changes';
@@ -86,7 +87,7 @@ async function normalizeOptions(options: Options): Promise<NormalizedOptions> {
   // Should remove this check 04/2023 once Node 14 & npm 6 reach EOL
   const npxYesFlagNeeded = !npmVersion.startsWith('6'); // npm 7 added -y flag to npx
   const isVite = options.vite;
-  const isStandalone = !options.integrated;
+  const isStandalone = !options.integrated; // isStandAlone would be default true if not integrated
 
   const nxCloud =
     options.nxCloud ?? (options.interactive ? await askAboutNxCloud() : false);
@@ -105,6 +106,13 @@ async function normalizeOptions(options: Options): Promise<NormalizedOptions> {
   };
 }
 
+/**
+ * - Create a temp workspace
+ * - Move all files to temp workspace
+ * - Add bundler to temp workspace
+ * - Move files back to root
+ * - Clean up unused files
+ */
 async function reorgnizeWorkspaceStructure(options: NormalizedOptions) {
   createTempWorkspace(options);
 
@@ -187,13 +195,56 @@ function createTempWorkspace(options: NormalizedOptions) {
   removeSync('node_modules');
 }
 
+function copyPackageJsonDepsFromTempWorkspace() {
+  let rootPackageJson = readJsonFile('package.json');
+  const tempWorkspacePackageJson = readJsonFile(
+    join('temp-workspace', 'package.json')
+  );
+
+  rootPackageJson = overridePackageDeps(
+    'dependencies',
+    rootPackageJson,
+    tempWorkspacePackageJson
+  );
+  rootPackageJson = overridePackageDeps(
+    'devDependencies',
+    rootPackageJson,
+    tempWorkspacePackageJson
+  );
+  rootPackageJson.scripts = {}; // remove existing scripts
+  writeJsonFile('package.json', rootPackageJson);
+  writeJsonFile(join('temp-workspace', 'package.json'), rootPackageJson);
+}
+
+function overridePackageDeps(
+  depConfigName: 'dependencies' | 'devDependencies',
+  base: PackageJson,
+  override: PackageJson
+): PackageJson {
+  if (!base[depConfigName]) {
+    base[depConfigName] = override[depConfigName];
+    return base;
+  }
+  const deps = base[depConfigName];
+  Object.keys(deps).forEach((dep) => {
+    if (base.dependencies?.[dep]) {
+      delete base.dependencies[dep];
+    }
+    if (base.devDependencies?.[dep]) {
+      delete base.devDependencies[dep];
+    }
+    base[depConfigName][dep] = deps[dep];
+  });
+  return base;
+}
+
 function moveFilesToTempWorkspace(options: NormalizedOptions) {
   output.log({ title: '🚚 Moving your React app in your new Nx workspace' });
 
+  copyPackageJsonDepsFromTempWorkspace();
   const requiredCraFiles = [
-    'project.json',
-    options.isStandalone ? null : 'package.json',
     'src',
+    'package.json',
     'public',
     options.appIsJs ? null : 'tsconfig.json',
     options.packageManager === 'yarn' ? 'yarn.lock' : null,
@@ -201,7 +252,7 @@ function moveFilesToTempWorkspace(options: NormalizedOptions) {
     options.packageManager === 'npm' ? 'package-lock.json' : null,
   ];
 
-  const optionalCraFiles = ['README.md'];
+  const optionalCraFiles = ['project.json', 'README.md'];
 
   const filesToMove = [...requiredCraFiles, ...optionalCraFiles].filter(
     Boolean
@@ -292,7 +343,7 @@ function cleanUpUnusedFilesAndAddConfigFiles(options: NormalizedOptions) {
     setupE2eProject(options.reactAppName);
   } else {
     removeSync(join('apps', `${options.reactAppName}-e2e`));
-    execSync(`${options.pmc.rm} @nx/cypress eslint-plugin-cypress`);
+    execSync(`${options.pmc.rm} cypress @nx/cypress eslint-plugin-cypress`);
   }
 
   if (options.isStandalone) {
